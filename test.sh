@@ -126,6 +126,7 @@ jq -e '.sensor and .readable and (.energyPath|endswith("intel-rapl:0/energy_uj")
 
 # Simulation explains policy without mutating hardware or runtime state.
 run automation-set enabled true
+run automation-set quietEnabled false
 before_actions=$(wc -l <"$capture")
 simulation=$(ROG_TEST_CAPTURE="$capture" ROG_SYSFS_ROOT="$fixture/sys" ROG_CONTROL_NOW=500 PATH="$fixture:$PATH" "$helper" action automation-simulate)
 jq -e '.dryRun and .reason=="battery" and .preset=="battery"' <<<"$simulation" >/dev/null
