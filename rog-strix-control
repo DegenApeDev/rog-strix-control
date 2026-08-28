@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly VERSION="5.1.0"
+readonly SYSFS_ROOT="${ROG_SYSFS_ROOT:-/sys}"
+readonly ASUS_SYSFS="${ROG_ASUS_SYSFS:-$SYSFS_ROOT/devices/platform/asus-nb-wmi}"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rog-strix-control"
+readonly CONFIG_FILE="$CONFIG_DIR/control.json"
+readonly STATE_FILE="$CONFIG_DIR/runtime-state.json"
+readonly REPORT_FILE="$CONFIG_DIR/diagnostics.txt"
+readonly EVENT_FILE="$CONFIG_DIR/events.jsonl"
+readonly RULE_SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/70-rog-strix-energy.rules"
+readonly RULE_TARGET="/etc/udev/rules.d/70-rog-strix-energy.rules"
+
+read_value() { [[ -r $1 ]] && tr -d '\n' <"$1" || true; }
+command_value() { "$@" 2>/dev/null | sed -n 's/^.*: //p' | tail -n1; }
+hwmon_dir() {
+  local dir
+  for dir in "$SYSFS_ROOT"/class/hwmon/hwmon*; do
+    [[ $(read_value "$dir/name") == "$1" ]] && { printf '%s\n' "$dir"; return; }
+  done
+}
+
+power_supply_dir() {
+  local wanted=$1 dir
+  for dir in "$SYSFS_ROOT"/class/power_supply/*; do
+    [[ $(read_value "$dir/type") == "$wanted" ]] && { printf '%s\n' "$dir"; return; }
+  done
+}
+
+resolve_gpu_pci() {
+  local requested=${1:-auto} device
+  if [[ $requested =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ && -d $SYSFS_ROOT/bus/pci/devices/$requested ]]; then
+    printf '%s\n' "$requested"; return
+  fi
+  for device in "$SYSFS_ROOT"/bus/pci/devices/*; do
+    [[ $(read_value "$device/vendor") == 0x10de ]] && { printf '%s\n' "${device##*/}"; return; }
+  done
+  printf '%s\n' '0000:01:00.0'
+}
+
+energy_counter_path() {
+  local zone
+  for zone in "$SYSFS_ROOT"/class/powercap/intel-rapl/intel-rapl:*; do
+    [[ ${zone##*/} =~ ^intel-rapl:[0-9]+$ && -e $zone/energy_uj ]] && { printf '%s\n' "$zone/energy_uj"; return; }
+  done
+}
+
+permissions_json() {
+  local energy='' sensor=false readable=false rule_installed=false group_exists=false wheel_member=false
+  energy=$(energy_counter_path || true)
+  [[ -n $energy ]] && sensor=true
+  [[ -n $energy && -r $energy ]] && readable=true
+  [[ -r $RULE_SOURCE && -r $RULE_TARGET ]] && cmp -s "$RULE_SOURCE" "$RULE_TARGET" && rule_installed=true
+  getent group wheel >/dev/null 2>&1 && group_exists=true
+  id -nG 2>/dev/null | tr ' ' '\n' | grep -Fxq wheel && wheel_member=true
+  jq -cn --arg energyPath "$energy" --arg ruleTarget "$RULE_TARGET" --argjson sensor "$sensor" --argjson readable "$readable" --argjson ruleInstalled "$rule_installed" --argjson groupExists "$group_exists" --argjson wheelMember "$wheel_member" '{sensor:$sensor,readable:$readable,ruleInstalled:$ruleInstalled,groupExists:$groupExists,wheelMember:$wheelMember,energyPath:$energyPath,ruleTarget:$ruleTarget,canInstall:($sensor and $groupExists and $wheelMember),needsSetup:($sensor and ($readable|not))}'
+}
+
+record_event() {
+  local reason=$1 preset=$2 outcome=$3 now tmp
+  now=$(date -Is)
+  jq -cn --arg at "$now" --arg reason "$reason" --arg preset "$preset" --arg outcome "$outcome" '{at:$at,reason:$reason,preset:$preset,outcome:$outcome}' >>"$EVENT_FILE"
+  chmod 0600 "$EVENT_FILE"
+  tmp=$(mktemp "$CONFIG_DIR/.events.XXXXXX")
+  tail -n 100 "$EVENT_FILE" >"$tmp"; chmod 0600 "$tmp"; mv -f "$tmp" "$EVENT_FILE"
+}
+
+default_config() {
+  jq -cn '{version:2,automation:{enabled:false,acPreset:"daily",batteryPreset:"battery",quietEnabled:false,quietStart:22,quietEnd:7,quietPreset:"quiet",thermalEnabled:false,thermalOn:88,thermalOff:78,thermalPreset:"gaming",cooldownSeconds:60,manualUntil:0},presets:[{name:"gaming",profile:"Performance",brightness:"high",panelOd:1,batteryLimit:100,auraColor:"ff1818"},{name:"daily",profile:"Balanced",brightness:"med",panelOd:0,batteryLimit:80,auraColor:"39ff14"},{name:"quiet",profile:"Quiet",brightness:"low",panelOd:0,batteryLimit:80,auraColor:"39ff14"},{name:"battery",profile:"Quiet",brightness:"off",panelOd:0,batteryLimit:60,auraColor:"39ff14"}],gameRules:[]}'
+}
+
+ensure_config() {
+  install -d -m 0700 "$CONFIG_DIR"
+  if [[ ! -f $CONFIG_FILE ]]; then default_config >"$CONFIG_FILE"; chmod 0600 "$CONFIG_FILE"; fi
+  if jq -e '.version == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+    write_config "$(jq -c '.version=2 | .automation.manualUntil=(.automation.manualUntil // 0)' "$CONFIG_FILE")"
+  fi
+  validate_config "$CONFIG_FILE" >/dev/null 2>&1 || { printf 'Control configuration is invalid\n' >&2; return 6; }
+}
+
+validate_config() {
+  jq -e '
+    (.presets | map(.name)) as $names |
+    .version == 2 and
+    (.presets | type == "array" and length > 0 and all(
+      type == "object" and
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$")) and
+      (.profile | IN("Quiet", "Balanced", "Performance")) and
+      (.brightness | IN("off", "low", "med", "high")) and
+      (.panelOd | IN(0, 1)) and
+      (.batteryLimit | IN(60, 80, 100)) and
+      (.auraColor | type == "string" and test("^[0-9a-fA-F]{6}$"))
+    )) and
+    (($names | length) == ($names | unique | length)) and
+    (.gameRules | type == "array" and all(
+      (.exe | type == "string" and test("^[A-Za-z0-9._+-]{1,64}$")) and
+      (.preset as $preset | $names | index($preset) != null) and
+      ((.preventSleep // false) | type == "boolean") and
+      ((.panelOverride // false) | type == "boolean")
+    )) and
+    (.automation | type == "object") and
+    (.automation.enabled | type == "boolean") and
+    (.automation.quietEnabled | type == "boolean") and
+    (.automation.thermalEnabled | type == "boolean") and
+    ([.automation.acPreset, .automation.batteryPreset, .automation.quietPreset, .automation.thermalPreset] |
+      all(. as $preset | $names | index($preset) != null)) and
+    (.automation.quietStart | type == "number" and . >= 0 and . <= 23 and floor == .) and
+    (.automation.quietEnd | type == "number" and . >= 0 and . <= 23 and floor == .) and
+    (.automation.thermalOn | type == "number" and . >= 40 and . <= 120 and floor == .) and
+    (.automation.thermalOff | type == "number" and . >= 40 and . <= 120 and floor == .) and
+    (.automation.thermalOff <= .automation.thermalOn) and
+    (.automation.cooldownSeconds | type == "number" and . >= 30 and . <= 9999 and floor == .)
+    and (.automation.manualUntil | type == "number" and . >= 0 and floor == .)
+  ' "$1"
+}
+
+valid_name() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$ ]]; }
+valid_preset_json() {
+  jq -e 'type=="object" and (.name|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$")) and (.profile|IN("Quiet","Balanced","Performance")) and (.brightness|IN("off","low","med","high")) and (.panelOd|IN(0,1)) and (.batteryLimit|IN(60,80,100)) and (.auraColor|type=="string" and test("^[0-9a-fA-F]{6}$"))' >/dev/null 2>&1 <<<"$1"
+}
+
+write_config() {
+  local json=$1 tmp
+  tmp=$(mktemp "$CONFIG_DIR/.control.XXXXXX")
+  printf '%s\n' "$json" >"$tmp"; chmod 0600 "$tmp"; mv -f "$tmp" "$CONFIG_FILE"
+}
+
+acquire_action_lock() {
+  install -d -m 0700 "$CONFIG_DIR"
+  exec 9>"$CONFIG_DIR/action.lock"
+  chmod 0600 "$CONFIG_DIR/action.lock"
+  flock -w 10 9 || { printf 'Another ROG control action is still running\n' >&2; return 8; }
+}
+
+control_json() {
+  ensure_config
+  local state='{}' events='[]'
+  [[ -r $STATE_FILE ]] && state=$(jq -c . "$STATE_FILE" 2>/dev/null || printf '{}')
+  [[ -r $EVENT_FILE ]] && events=$(jq -sc 'reverse' "$EVENT_FILE" 2>/dev/null || printf '[]')
+  jq -c --argjson runtime "$state" --argjson events "$events" '. + {runtime:$runtime,events:$events}' "$CONFIG_FILE"
+}
+
+find_preset() { ensure_config; jq -ce --arg name "$1" '.presets[]|select(.name==$name)' "$CONFIG_FILE" | head -n1; }
+
+snapshot_json() {
+  local profile led limit panel gpu
+  profile=$(asusctl profile get 2>/dev/null | sed -n 's/^Active profile: //p' | tail -n1 || true)
+  led=$(command_value asusctl leds get || true); led=${led,,}
+  limit=$(command_value asusctl battery info || true); limit=${limit%%%}
+  panel=$(read_value "$ASUS_SYSFS/panel_od"); gpu=$(supergfxctl -g 2>/dev/null || true)
+  [[ $profile =~ ^(Quiet|Balanced|Performance)$ ]] || profile=Balanced
+  [[ $led =~ ^(off|low|med|high)$ ]] || led=med
+  [[ $limit =~ ^(60|80|100)$ ]] || limit=80
+  [[ $panel =~ ^[01]$ ]] || panel=0
+  jq -cn --arg profile "$profile" --arg brightness "$led" --argjson panelOd "$panel" --argjson batteryLimit "$limit" --arg gpuMode "$gpu" '{profile:$profile,brightness:$brightness,panelOd:$panelOd,batteryLimit:$batteryLimit,gpuMode:$gpuMode}'
+}
+
+apply_snapshot() {
+  local data=$1 profile brightness panel limit
+  profile=$(jq -r .profile <<<"$data"); brightness=$(jq -r .brightness <<<"$data"); panel=$(jq -r .panelOd <<<"$data"); limit=$(jq -r .batteryLimit <<<"$data")
+  asusctl profile set "$profile" >/dev/null
+  asusctl leds set "$brightness" >/dev/null
+  [[ -e $ASUS_SYSFS/panel_od ]] && asusctl armoury set panel_overdrive "$panel" >/dev/null
+  asusctl battery limit "$limit" >/dev/null
+}
+
+apply_preset() {
+  local name=$1 preset before profile brightness panel limit color
+  preset=$(find_preset "$name") || { printf 'Unknown preset: %s\n' "$name" >&2; return 3; }
+  before=$(snapshot_json)
+  profile=$(jq -r .profile <<<"$preset"); brightness=$(jq -r .brightness <<<"$preset"); panel=$(jq -r .panelOd <<<"$preset"); limit=$(jq -r .batteryLimit <<<"$preset"); color=$(jq -r .auraColor <<<"$preset")
+  if ! { asusctl profile set "$profile" >/dev/null && asusctl leds set "$brightness" >/dev/null && { [[ ! -e $ASUS_SYSFS/panel_od ]] || asusctl armoury set panel_overdrive "$panel" >/dev/null; } && asusctl battery limit "$limit" >/dev/null && asusctl aura effect static --colour "$color" >/dev/null; }; then
+    apply_snapshot "$before" || true
+    printf 'Preset failed; previous settings restored\n' >&2; return 7
+  fi
+  printf 'Preset %s applied\n' "$name"
+}
+
+save_current_preset() {
+  local name=$1 snap color current next
+  valid_name "$name" || return 2; color=${2:-39ff14}; [[ $color =~ ^[0-9a-fA-F]{6}$ ]] || return 2
+  snap=$(snapshot_json); current=$(jq -c --arg name "$name" --arg color "$color" '. + {name:$name,auraColor:$color}' <<<"$snap")
+  next=$(jq -c --arg name "$name" --argjson preset "$current" '.presets = ([.presets[]|select(.name!=$name)] + [$preset])' "$CONFIG_FILE")
+  write_config "$next"; printf 'Preset %s saved\n' "$name"
+}
+
+preset_mutation() {
+  ensure_config
+  local op=$1 name=${2:-} arg=${3:-} next count
+  valid_name "$name" || return 2
+  case "$op" in
+    delete)
+      count=$(jq --arg name "$name" '[.presets[]|select(.name!=$name)]|length' "$CONFIG_FILE"); ((count > 0)) || { printf 'Cannot delete the final preset\n' >&2; return 3; }
+      next=$(jq -c --arg name "$name" '.presets=[.presets[]|select(.name!=$name)] | .gameRules=[.gameRules[]|select(.preset!=$name)]' "$CONFIG_FILE") ;;
+    duplicate)
+      valid_name "$arg" || return 2
+      jq -e --arg name "$arg" '.presets|any(.name==$name)' "$CONFIG_FILE" >/dev/null && { printf 'Preset already exists\n' >&2; return 3; }
+      next=$(jq -c --arg name "$name" --arg new "$arg" '.presets += [(.presets[]|select(.name==$name)|.name=$new)]' "$CONFIG_FILE") ;;
+    rename)
+      valid_name "$arg" || return 2
+      jq -e --arg name "$arg" '.presets|any(.name==$name)' "$CONFIG_FILE" >/dev/null && { printf 'Preset already exists\n' >&2; return 3; }
+      next=$(jq -c --arg name "$name" --arg new "$arg" '(.presets[]|select(.name==$name)|.name)=$new | (.gameRules[]|select(.preset==$name)|.preset)=$new | .automation |= with_entries(.value |= if .==$name then $new else . end)' "$CONFIG_FILE") ;;
+    move)
+      [[ $arg =~ ^(up|down)$ ]] || return 2
+      next=$(jq -c --arg name "$name" --arg dir "$arg" '.presets as $p | ($p|map(.name)|index($name)) as $i | if $i==null then . elif ($dir=="up" and $i>0) then .presets[$i-1:$i+1] |= reverse elif ($dir=="down" and $i<($p|length)-1) then .presets[$i:$i+2] |= reverse else . end' "$CONFIG_FILE") ;;
+    *) return 2 ;;
+  esac
+  write_config "$next"; printf 'Preset list updated\n'
+}
+
+preset_update() {
+  ensure_config
+  local name=$1 field=$2 value=$3 filter
+  find_preset "$name" >/dev/null || return 3
+  case "$field" in
+    profile) [[ $value =~ ^(Quiet|Balanced|Performance)$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.profile)=$value' ;;
+    brightness) [[ $value =~ ^(off|low|med|high)$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.brightness)=$value' ;;
+    panelOd) [[ $value =~ ^[01]$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.panelOd)=($value|tonumber)' ;;
+    batteryLimit) [[ $value =~ ^(60|80|100)$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.batteryLimit)=($value|tonumber)' ;;
+    auraColor) [[ $value =~ ^[0-9a-fA-F]{6}$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.auraColor)=$value' ;;
+    *) return 2 ;;
+  esac
+  write_config "$(jq -c --arg name "$name" --arg value "$value" "$filter" "$CONFIG_FILE")"
+  printf 'Preset %s updated: %s\n' "$name" "$field"
+}
+
+set_automation() {
+  ensure_config
+  local key=$1 value=$2 filter next
+  case "$key" in
+    enabled|quietEnabled|thermalEnabled) [[ $value =~ ^(true|false)$ ]] || return 2; filter='.automation[$key]=($value=="true")' ;;
+    acPreset|batteryPreset|quietPreset|thermalPreset) valid_name "$value" || return 2; find_preset "$value" >/dev/null || return 3; filter='.automation[$key]=$value' ;;
+    quietStart|quietEnd) [[ $value =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || return 2; filter='.automation[$key]=($value|tonumber)' ;;
+    thermalOn|thermalOff) [[ $value =~ ^([4-9][0-9]|1[01][0-9]|120)$ ]] || return 2; filter='.automation[$key]=($value|tonumber)' ;;
+    cooldownSeconds) [[ $value =~ ^([3-9][0-9]|[1-9][0-9]{2,3})$ ]] || return 2; filter='.automation[$key]=($value|tonumber)' ;;
+    manualUntil) [[ $value =~ ^[0-9]{1,12}$ ]] || return 2; filter='.automation[$key]=($value|tonumber)' ;;
+    *) return 2 ;;
+  esac
+  next=$(jq -c --arg key "$key" --arg value "$value" "$filter" "$CONFIG_FILE")
+  jq -e '.automation.thermalOff <= .automation.thermalOn' <<<"$next" >/dev/null || { printf 'Thermal off threshold must not exceed on threshold\n' >&2; return 2; }
+  write_config "$next"
+  if [[ $key == enabled && $value == false && -r $STATE_FILE ]]; then
+    local previous inhibit_pid
+    previous=$(jq -c '.previousSnapshot // null' "$STATE_FILE" 2>/dev/null || printf null); inhibit_pid=$(jq -r '.inhibitPid // 0' "$STATE_FILE" 2>/dev/null || printf 0)
+    [[ $previous == null ]] || apply_snapshot "$previous"
+    if [[ $inhibit_pid =~ ^[0-9]+$ ]] && ((inhibit_pid > 1)) && [[ -r /proc/$inhibit_pid/cmdline ]] && tr '\0' ' ' <"/proc/$inhibit_pid/cmdline" | grep -q 'systemd-inhibit'; then kill "$inhibit_pid" 2>/dev/null || true; fi
+    jq -cn '{activeReason:"",activePreset:"",activeGame:"",lastSwitch:0,previousSnapshot:null,inhibitPid:0}' >"$STATE_FILE"; chmod 0600 "$STATE_FILE"
+  fi
+  printf 'Automation setting saved\n'
+}
+
+game_rule() {
+  ensure_config
+  local op=$1 exe=$2 preset=${3:-} extras=${4:-full} next
+  [[ $exe =~ ^[A-Za-z0-9._+-]{1,64}$ ]] || return 2
+  case "$op" in
+    add) valid_name "$preset" || return 2; [[ $extras =~ ^(full|safe)$ ]] || return 2; find_preset "$preset" >/dev/null || return 3; next=$(jq -c --arg exe "$exe" --arg preset "$preset" --arg extras "$extras" '.gameRules=([.gameRules[]|select(.exe!=$exe)]+[{exe:$exe,preset:$preset,preventSleep:($extras=="full"),panelOverride:($extras=="full")}])' "$CONFIG_FILE") ;;
+    remove) next=$(jq -c --arg exe "$exe" '.gameRules=[.gameRules[]|select(.exe!=$exe)]' "$CONFIG_FILE") ;;
+    *) return 2 ;;
+  esac
+  write_config "$next"; printf 'Game rules updated\n'
+}
+
+automation_tick() {
+  ensure_config
+  jq -e '.automation.enabled' "$CONFIG_FILE" >/dev/null || { printf 'Automation disabled\n'; return; }
+  local now last=0 cooldown target reason=power game='' prevent_sleep=false panel_override=false temp=-1 hour start end quiet=false thermal=false previous='null' active_reason='' inhibit_pid=0 ac_supply
+  now=${ROG_CONTROL_NOW:-$(date +%s)}; [[ $now =~ ^[0-9]+$ ]] || return 2; cooldown=$(jq -r '.automation.cooldownSeconds' "$CONFIG_FILE")
+  local manual_until; manual_until=$(jq -r '.automation.manualUntil // 0' "$CONFIG_FILE")
+  if ((now < manual_until)); then printf 'Automation manually paused until %s\n' "$(date -d "@$manual_until" +%H:%M 2>/dev/null || printf '%s' "$manual_until")"; return; fi
+  [[ -r $STATE_FILE ]] && { last=$(jq -r '.lastSwitch // 0' "$STATE_FILE" 2>/dev/null || printf 0); previous=$(jq -c '.previousSnapshot // null' "$STATE_FILE" 2>/dev/null || printf null); active_reason=$(jq -r '.activeReason // ""' "$STATE_FILE" 2>/dev/null || true); inhibit_pid=$(jq -r '.inhibitPid // 0' "$STATE_FILE" 2>/dev/null || printf 0); }
+  while IFS=$'\t' read -r exe preset prevent_sleep panel_override; do if pgrep -x -- "$exe" >/dev/null 2>&1; then game=$exe; target=$preset; reason="game:$exe"; break; fi; done < <(jq -r '.gameRules[]|[.exe,.preset,(.preventSleep//false),(.panelOverride//false)]|@tsv' "$CONFIG_FILE")
+  if [[ -z $game ]]; then
+    local cpu_hw raw
+    cpu_hw=$(hwmon_dir k10temp || true); [[ -n $cpu_hw ]] && raw=$(read_value "$cpu_hw/temp1_input") || raw=''; [[ $raw =~ ^[0-9]+$ ]] && temp=$((raw/1000))
+    if jq -e '.automation.thermalEnabled' "$CONFIG_FILE" >/dev/null && { ((temp >= $(jq -r .automation.thermalOn "$CONFIG_FILE"))) || [[ $active_reason == thermal && $temp -ge $(jq -r .automation.thermalOff "$CONFIG_FILE") ]]; }; then thermal=true; target=$(jq -r .automation.thermalPreset "$CONFIG_FILE"); reason=thermal; fi
+    hour=$((10#$(date +%H))); start=$(jq -r .automation.quietStart "$CONFIG_FILE"); end=$(jq -r .automation.quietEnd "$CONFIG_FILE")
+    if jq -e '.automation.quietEnabled' "$CONFIG_FILE" >/dev/null && { ((start < end && hour >= start && hour < end)) || ((start >= end && (hour >= start || hour < end))); }; then quiet=true; [[ $thermal == false ]] && { target=$(jq -r .automation.quietPreset "$CONFIG_FILE"); reason=schedule; }; fi
+    if [[ -z ${target:-} ]]; then ac_supply=$(power_supply_dir Mains || power_supply_dir USB || true); [[ -n $ac_supply && $(read_value "$ac_supply/online") == 1 ]] && { target=$(jq -r .automation.acPreset "$CONFIG_FILE"); reason=ac; } || { target=$(jq -r .automation.batteryPreset "$CONFIG_FILE"); reason=battery; }; fi
+  fi
+  if [[ ${ROG_CONTROL_DRY_RUN:-false} == true ]]; then jq -cn --arg reason "$reason" --arg preset "$target" --arg game "$game" '{dryRun:true,reason:$reason,preset:$preset,game:$game}'; return; fi
+  if [[ $reason == "$active_reason" ]]; then printf 'Automation steady: %s\n' "$reason"; return; fi
+  ((now-last >= cooldown)) || { printf 'Automation cooldown\n'; return; }
+  if [[ $reason == game:* && $previous == null ]]; then previous=$(snapshot_json); fi
+  if [[ $active_reason == game:* && $reason != game:* && $previous != null ]]; then
+    apply_snapshot "$previous"; previous=null
+    if [[ $inhibit_pid =~ ^[0-9]+$ ]] && ((inhibit_pid > 1)) && [[ -r /proc/$inhibit_pid/cmdline ]] && tr '\0' ' ' <"/proc/$inhibit_pid/cmdline" | grep -q 'systemd-inhibit'; then kill "$inhibit_pid" 2>/dev/null || true; fi
+    inhibit_pid=0
+    # The power, schedule, or thermal policy may have changed while the game
+    # was active. Apply its preset before recording that policy as steady.
+    apply_preset "$target" >/dev/null
+  else
+    apply_preset "$target" >/dev/null
+    [[ $panel_override == true && -e $ASUS_SYSFS/panel_od ]] && asusctl armoury set panel_overdrive 1 >/dev/null
+    if [[ $prevent_sleep == true && $inhibit_pid -eq 0 ]] && command -v systemd-inhibit >/dev/null 2>&1; then systemd-inhibit --what=idle:sleep --mode=block --who='ROG Control Deck' --why='Configured game profile is active' sleep infinity 9>&- >/dev/null 2>&1 & inhibit_pid=$!; fi
+  fi
+  jq -cn --arg reason "$reason" --arg preset "$target" --arg game "$game" --argjson lastSwitch "$now" --argjson previousSnapshot "$previous" --argjson inhibitPid "$inhibit_pid" '{activeReason:$reason,activePreset:$preset,activeGame:$game,lastSwitch:$lastSwitch,previousSnapshot:$previousSnapshot,inhibitPid:$inhibitPid}' >"$STATE_FILE"; chmod 0600 "$STATE_FILE"
+  record_event "$reason" "$target" applied
+  printf 'Automation: %s → %s\n' "$reason" "$target"
+}
+
+diagnostics_json() {
+  local asusd=inactive supergfxd=inactive nvidia=missing modules sensors cpu_power=locked issues='[]' recent='[]' cpu_hw
+  systemctl is-active --quiet asusd 2>/dev/null && asusd=active
+  systemctl is-active --quiet supergfxd 2>/dev/null && supergfxd=active
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia=available
+  modules=$(for m in asus_nb_wmi asus_wmi nvidia; do grep -qw "^$m" /proc/modules 2>/dev/null && printf '%s ' "$m"; done | xargs)
+  sensors=0
+  for sensor_file in "$SYSFS_ROOT"/class/hwmon/hwmon*/temp*_input; do [[ -r $sensor_file ]] && sensors=$((sensors+1)); done
+  cpu_hw=$(hwmon_dir k10temp || true)
+  { [[ -r $SYSFS_ROOT/class/powercap/intel-rapl/intel-rapl:0/energy_uj ]] || [[ -n $cpu_hw && -r $cpu_hw/power1_input ]]; } && cpu_power=available
+  [[ $asusd == active ]] || issues=$(jq -c '.+["asusd is not active; ASUS controls are unavailable"]' <<<"$issues")
+  [[ $supergfxd == active ]] || issues=$(jq -c '.+["supergfxd is not active; GPU switching is unavailable"]' <<<"$issues")
+  [[ $sensors -gt 0 ]] || issues=$(jq -c '.+["No readable thermal sensors were found"]' <<<"$issues")
+  [[ $cpu_power == available ]] || issues=$(jq -c '.+["No readable CPU package power sensor was found; CPU watts cannot be measured"]' <<<"$issues")
+  command -v journalctl >/dev/null 2>&1 && recent=$(journalctl -u asusd -u supergfxd -p warning -n 5 --no-pager -o cat 2>/dev/null | jq -Rsc 'split("\n")|map(select(length>0))' || printf '[]')
+  jq -cn --arg asusd "$asusd" --arg supergfxd "$supergfxd" --arg nvidia "$nvidia" --arg modules "$modules" --arg cpuPower "$cpu_power" --argjson sensorCount "$sensors" --argjson issues "$issues" --argjson recentErrors "$recent" '{asusd:$asusd,supergfxd:$supergfxd,nvidia:$nvidia,modules:($modules|split(" ")|map(select(.!=""))),sensorCount:$sensorCount,cpuPower:$cpuPower,issues:$issues,recentErrors:$recentErrors,healthy:($asusd=="active" and $supergfxd=="active" and $sensorCount>0)}'
+}
+
+write_report() {
+  ensure_config
+  local diag control model board kernel
+  diag=$(diagnostics_json); control=$(control_json); model=$(read_value "$SYSFS_ROOT/class/dmi/id/product_name"); board=$(read_value "$SYSFS_ROOT/class/dmi/id/board_name"); kernel=$(uname -r)
+  { printf 'ROG Strix Control Deck diagnostics v%s\nGenerated: %s\nModel: %s\nBoard: %s\nKernel: %s\n\nHealth:\n' "$VERSION" "$(date -Is)" "$model" "$board" "$kernel"; jq -r 'del(.recentErrors)|to_entries[]|"  \(.key): \(.value)"' <<<"$diag"; printf '\nConfiguration (sanitized):\n'; jq '{automation,presets,gameRules,runtime}' <<<"$control"; } >"$REPORT_FILE"
+  chmod 0600 "$REPORT_FILE"; printf '%s\n' "$REPORT_FILE"
+}
+
+status_json() {
+  local pci; pci=$(resolve_gpu_pci "${1:-auto}")
+  local vendor model board profile led battery_limit battery_pct battery_status
+  local gpu_state='' gpu_watts='' gpu_temp=-1 gpu_util=-1 gpu_memory=-1
+  local aura_mode='' panel_od boot_sound dgpu_disabled asusctl_ready=false asus_hwmon cpu_hwmon igpu_hwmon
+  local cpu_fan=-1 gpu_fan=-1 cpu_temp=-1 igpu_temp=-1
+  local cpu_freq=-1 igpu_watts='' battery_watts='' battery_minutes=-1 ac_online=false
+  local cpu_energy=-1 cpu_energy_max=-1 cpu_power_watts=-1 sampled_ms
+  local ac_profile='' battery_profile='' profiles='' aura_modes='' aura_zones=false panel_od_supported=false boot_sound_supported=false
+  local supergfx_installed=false supergfx_ready=false gpu_mode='' gpu_power='' gpu_pending_action='' gpu_pending_mode='' gpu_modes='' gpu_clients=0
+  vendor=$(read_value "$SYSFS_ROOT/class/dmi/id/sys_vendor"); model=$(read_value "$SYSFS_ROOT/class/dmi/id/product_name"); board=$(read_value "$SYSFS_ROOT/class/dmi/id/board_name")
+  profile=$(asusctl profile get 2>/dev/null | sed -n 's/^Active profile: //p' | tail -n1 || true)
+  led=$(command_value asusctl leds get || true); battery_limit=$(command_value asusctl battery info || true); battery_limit=${battery_limit%%%}
+  local battery_supply ac_supply
+  battery_supply=$(power_supply_dir Battery || true); ac_supply=$(power_supply_dir Mains || power_supply_dir USB || true)
+  battery_pct=$(read_value "$battery_supply/capacity"); battery_status=$(read_value "$battery_supply/status")
+  panel_od=$(read_value "$ASUS_SYSFS/panel_od"); boot_sound=$(read_value "$ASUS_SYSFS/boot_sound"); dgpu_disabled=$(read_value "$ASUS_SYSFS/dgpu_disable")
+  gpu_state=$(read_value "$SYSFS_ROOT/bus/pci/devices/$pci/power/runtime_status")
+  asus_hwmon=$(hwmon_dir asus || true); cpu_hwmon=$(hwmon_dir k10temp || true); igpu_hwmon=$(hwmon_dir amdgpu || true)
+  [[ -n $asus_hwmon ]] && { cpu_fan=$(read_value "$asus_hwmon/fan1_input"); gpu_fan=$(read_value "$asus_hwmon/fan2_input"); }
+  [[ -n $cpu_hwmon ]] && cpu_temp=$(read_value "$cpu_hwmon/temp1_input")
+  [[ -n $igpu_hwmon ]] && igpu_temp=$(read_value "$igpu_hwmon/temp1_input")
+  [[ $cpu_temp =~ ^[0-9]+$ ]] && cpu_temp=$((cpu_temp / 1000)) || cpu_temp=-1
+  [[ $igpu_temp =~ ^[0-9]+$ ]] && igpu_temp=$((igpu_temp / 1000)) || igpu_temp=-1
+  [[ $cpu_fan =~ ^[0-9]+$ ]] || cpu_fan=-1; [[ $gpu_fan =~ ^[0-9]+$ ]] || gpu_fan=-1
+  aura_mode=$(sed -n 's/^[[:space:]]*current_mode: \([^,]*\),/\1/p' /etc/asusd/aura_*.ron 2>/dev/null | head -n1 || true)
+  profiles=$(asusctl profile list 2>/dev/null | sed -n '/^[A-Za-z][A-Za-z]*$/p' | xargs || true)
+  aura_modes=$(asusctl aura effect 2>&1 | sed -n '/Available modes:/,$s/^[[:space:]][[:space:]]*\([A-Za-z][A-Za-z]*\)$/\1/p' | xargs || true)
+  grep -q 'multizone: Some' /etc/asusd/aura_*.ron 2>/dev/null && aura_zones=true
+  ac_profile=$(sed -n 's/^[[:space:]]*platform_profile_on_ac: \([^,]*\),/\1/p' /etc/asusd/asusd.ron 2>/dev/null | head -n1 || true)
+  battery_profile=$(sed -n 's/^[[:space:]]*platform_profile_on_battery: \([^,]*\),/\1/p' /etc/asusd/asusd.ron 2>/dev/null | head -n1 || true)
+  [[ -e $ASUS_SYSFS/panel_od ]] && panel_od_supported=true; [[ -e $ASUS_SYSFS/boot_sound ]] && boot_sound_supported=true
+  local freq_total=0 freq_count=0 freq
+  for freq_file in "$SYSFS_ROOT"/devices/system/cpu/cpufreq/policy*/scaling_cur_freq; do
+    freq=$(read_value "$freq_file"); [[ $freq =~ ^[0-9]+$ ]] || continue; freq_total=$((freq_total + freq)); freq_count=$((freq_count + 1))
+  done
+  ((freq_count > 0)) && cpu_freq=$((freq_total / freq_count / 1000))
+  sampled_ms=$(date +%s%3N)
+  cpu_energy=$(read_value "$SYSFS_ROOT/class/powercap/intel-rapl/intel-rapl:0/energy_uj")
+  cpu_energy_max=$(read_value "$SYSFS_ROOT/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj")
+  [[ $cpu_energy =~ ^[0-9]+$ ]] || cpu_energy=-1; [[ $cpu_energy_max =~ ^[0-9]+$ ]] || cpu_energy_max=-1
+  local cpu_power_raw
+  [[ -n $cpu_hwmon ]] && cpu_power_raw=$(read_value "$cpu_hwmon/power1_input") || cpu_power_raw=''
+  [[ $cpu_power_raw =~ ^[0-9]+$ ]] && cpu_power_watts=$(awk -v n="$cpu_power_raw" 'BEGIN {printf "%.2f", n/1000000}')
+  [[ -n $igpu_hwmon ]] && igpu_watts=$(read_value "$igpu_hwmon/power1_input")
+  [[ $igpu_watts =~ ^[0-9]+$ ]] && igpu_watts=$(awk -v n="$igpu_watts" 'BEGIN {printf "%.2f", n/1000000}') || igpu_watts=''
+  local power_now energy_now
+  power_now=$(read_value "$battery_supply/power_now"); energy_now=$(read_value "$battery_supply/energy_now")
+  [[ $power_now =~ ^[0-9]+$ ]] && battery_watts=$(awk -v n="$power_now" 'BEGIN {printf "%.2f", n/1000000}') || battery_watts=''
+  if [[ $power_now =~ ^[0-9]+$ && $energy_now =~ ^[0-9]+$ ]] && ((power_now > 0)); then battery_minutes=$((energy_now * 60 / power_now)); fi
+  [[ -n $ac_supply && $(read_value "$ac_supply/online") == 1 ]] && ac_online=true
+  command -v asusctl >/dev/null 2>&1 && [[ -n $profile ]] && asusctl_ready=true
+  if [[ $gpu_state == active ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    IFS=, read -r gpu_watts gpu_temp gpu_util gpu_memory < <(nvidia-smi --query-gpu=power.draw,temperature.gpu,utilization.gpu,memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || true)
+  fi
+  [[ $gpu_temp =~ ^[0-9]+$ ]] || gpu_temp=-1; [[ $gpu_util =~ ^[0-9]+$ ]] || gpu_util=-1; [[ $gpu_memory =~ ^[0-9]+$ ]] || gpu_memory=-1
+  [[ $battery_limit =~ ^[0-9]+$ ]] || battery_limit=-1; [[ $battery_pct =~ ^[0-9]+$ ]] || battery_pct=-1
+  [[ $panel_od =~ ^[01]$ ]] || panel_od=0; [[ $boot_sound =~ ^[01]$ ]] || boot_sound=0; [[ $dgpu_disabled =~ ^[01]$ ]] || dgpu_disabled=0
+  command -v supergfxctl >/dev/null 2>&1 && supergfx_installed=true
+  if $supergfx_installed && supergfxctl -g >/dev/null 2>&1; then
+    supergfx_ready=true; gpu_mode=$(supergfxctl -g 2>/dev/null || true); gpu_power=$(supergfxctl -S 2>/dev/null || true)
+    gpu_pending_action=$(supergfxctl -p 2>/dev/null || true); gpu_pending_mode=$(supergfxctl -P 2>/dev/null || true)
+    gpu_modes=$(supergfxctl -s 2>/dev/null | tr -d '[],' | xargs || true)
+    [[ $gpu_pending_action == 'No action required' ]] && gpu_pending_action=''
+    [[ $gpu_pending_mode == 'Unknown' ]] && gpu_pending_mode=''
+    [[ -z $gpu_pending_action && $gpu_pending_mode == "$gpu_mode" ]] && gpu_pending_mode=''
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then gpu_clients=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l); fi
+  jq -cn --arg vendor "$vendor" --arg model "$model" --arg board "$board" --arg profile "$profile" --arg profiles "$profiles" --arg acProfile "$ac_profile" --arg batteryProfile "$battery_profile" --arg ledBrightness "$led" --arg auraMode "$aura_mode" --arg auraModes "$aura_modes" --arg gpuState "$gpu_state" --arg gpuWatts "$gpu_watts" --arg gpuMode "$gpu_mode" --arg gpuPower "$gpu_power" --arg gpuPendingAction "$gpu_pending_action" --arg gpuPendingMode "$gpu_pending_mode" --arg gpuModes "$gpu_modes" --arg igpuWatts "$igpu_watts" --arg batteryWatts "$battery_watts" --arg batteryStatus "$battery_status" --argjson gpuTemp "$gpu_temp" --argjson gpuUtil "$gpu_util" --argjson gpuMemory "$gpu_memory" --argjson gpuClients "$gpu_clients" --argjson cpuFan "$cpu_fan" --argjson gpuFan "$gpu_fan" --argjson cpuTemp "$cpu_temp" --argjson igpuTemp "$igpu_temp" --argjson cpuFreqMHz "$cpu_freq" --argjson cpuEnergyUj "$cpu_energy" --argjson cpuEnergyMaxUj "$cpu_energy_max" --argjson cpuPowerWatts "$cpu_power_watts" --argjson sampledMs "$sampled_ms" --argjson batteryMinutes "$battery_minutes" --argjson batteryLimit "$battery_limit" --argjson batteryPct "$battery_pct" --argjson panelOd "$panel_od" --argjson bootSound "$boot_sound" --argjson dgpuDisabled "$dgpu_disabled" --argjson asusctlReady "$asusctl_ready" --argjson supergfxInstalled "$supergfx_installed" --argjson supergfxReady "$supergfx_ready" --argjson auraZones "$aura_zones" --argjson panelOdSupported "$panel_od_supported" --argjson bootSoundSupported "$boot_sound_supported" --argjson acOnline "$ac_online" --arg helperVersion "$VERSION" '{vendor:$vendor,model:$model,board:$board,profile:$profile,profiles:($profiles|split(" ")|map(select(. != ""))),acProfile:$acProfile,batteryProfile:$batteryProfile,ledBrightness:$ledBrightness,auraMode:$auraMode,auraModes:($auraModes|split(" ")|map(select(. != ""))),gpuState:$gpuState,gpuWatts:$gpuWatts,gpuTemp:$gpuTemp,gpuUtil:$gpuUtil,gpuMemory:$gpuMemory,gpuClients:$gpuClients,gpuMode:$gpuMode,gpuPower:$gpuPower,gpuPendingAction:$gpuPendingAction,gpuPendingMode:$gpuPendingMode,gpuModes:($gpuModes|split(" ")|map(select(. != ""))),cpuFan:$cpuFan,gpuFan:$gpuFan,cpuTemp:$cpuTemp,igpuTemp:$igpuTemp,cpuFreqMHz:$cpuFreqMHz,cpuEnergyUj:$cpuEnergyUj,cpuEnergyMaxUj:$cpuEnergyMaxUj,cpuPowerWatts:$cpuPowerWatts,sampledMs:$sampledMs,igpuWatts:$igpuWatts,batteryWatts:$batteryWatts,batteryMinutes:$batteryMinutes,batteryLimit:$batteryLimit,batteryPct:$batteryPct,batteryStatus:$batteryStatus,acOnline:$acOnline,panelOd:($panelOd == 1),bootSound:($bootSound == 1),dgpuDisabled:($dgpuDisabled == 1),asusctlReady:$asusctlReady,supergfxInstalled:$supergfxInstalled,supergfxReady:$supergfxReady,capabilities:{aura:($auraMode != ""),auraZones:$auraZones,battery:($batteryLimit >= 0),panelOd:$panelOdSupported,bootSound:$bootSoundSupported,fans:($cpuFan >= 0 or $gpuFan >= 0),cpuPower:($cpuPowerWatts >= 0 or $cpuEnergyUj >= 0),supergfx:$supergfxReady},helperVersion:$helperVersion}'
+}
+
+run_action() {
+  local action=${1:-} value=${2:-} extra=${3:-} fourth=${4:-}
+  case "$action" in
+    profile) case "$value" in quiet) value=Quiet;; balanced) value=Balanced;; performance) value=Performance;; *) return 2;; esac; asusctl profile set "$value" ;;
+    brightness) [[ $value =~ ^(off|low|med|high)$ ]] || return 2; asusctl leds set "$value" ;;
+    aura-static)
+      [[ $value =~ ^[0-9a-fA-F]{6}$ && $extra =~ ^(global|1|2|3|4)$ ]] || return 2
+      [[ $extra == global ]] && asusctl aura effect static --colour "$value" || asusctl aura effect static --colour "$value" --zone "$extra"
+      ;;
+    aura-breathe)
+      [[ $value =~ ^[0-9a-fA-F]{6}$ && $extra =~ ^[0-9a-fA-F]{6}$ && $fourth =~ ^(low|med|high)$ ]] || return 2
+      asusctl aura effect breathe --colour "$value" --colour2 "$extra" --speed "$fourth"
+      ;;
+    aura-rainbow) [[ $value =~ ^(up|down|left|right)$ && $extra =~ ^(low|med|high)$ ]] || return 2; asusctl aura effect rainbow-wave --direction "$value" --speed "$extra" ;;
+    aura-cycle) [[ $value =~ ^(low|med|high)$ ]] || return 2; asusctl aura effect rainbow-cycle --speed "$value" ;;
+    battery-limit) [[ $value =~ ^(60|80|100)$ ]] || return 2; asusctl battery limit "$value" ;;
+    panel-od|boot-sound) [[ $value =~ ^[01]$ ]] || return 2; [[ $action == panel-od ]] && action=panel_overdrive || action=boot_sound; asusctl armoury set "$action" "$value" ;;
+    preset) valid_name "$value" || return 2; apply_preset "$value" ;;
+    preset-save) valid_name "$value" || return 2; save_current_preset "$value" "$extra" ;;
+    preset-delete|preset-duplicate|preset-rename|preset-move) preset_mutation "${action#preset-}" "$value" "$extra" ;;
+    preset-update) preset_update "$value" "$extra" "$fourth" ;;
+    automation-set) set_automation "$value" "$extra" ;;
+    game-add) game_rule add "$value" "$extra" "$fourth" ;;
+    game-remove) game_rule remove "$value" ;;
+    automation-tick) automation_tick ;;
+    automation-simulate) ROG_CONTROL_DRY_RUN=true automation_tick ;;
+    diagnostics-report) write_report ;;
+    config-export) ensure_config; jq . "$CONFIG_FILE" >"$CONFIG_DIR/export.json"; chmod 0600 "$CONFIG_DIR/export.json"; printf '%s\n' "$CONFIG_DIR/export.json" ;;
+    config-import) "$0" import "$CONFIG_DIR/import.json" ;;
+    gpu-mode)
+      [[ $value =~ ^(Integrated|Hybrid|Vfio|AsusMuxDgpu)$ ]] || return 2
+      command -v supergfxctl >/dev/null 2>&1 && supergfxctl -s 2>/dev/null | grep -qw -- "$value" || { printf 'GPU mode is not supported or supergfxd is unavailable\n' >&2; return 4; }
+      if [[ $value == Integrated ]]; then
+        local clients; clients=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l)
+        ((clients == 0)) || { printf 'Close %s active NVIDIA compute client(s) first\n' "$clients" >&2; return 5; }
+      fi
+      supergfxctl -m "$value"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+case ${1:-status} in
+  status) status_json "${2:-}" ;;
+  control) control_json ;;
+  diagnostics) diagnostics_json ;;
+  permissions) permissions_json ;;
+  report) write_report ;;
+  check) jq -cn --argjson status "$(status_json "${2:-}")" --argjson diagnostics "$(diagnostics_json)" '{status:$status,diagnostics:$diagnostics,ready:($status.asusctlReady and $diagnostics.asusd=="active")}' ;;
+  export) ensure_config; jq . "$CONFIG_FILE" ;;
+  import)
+    ensure_config
+    import_file=${2:-}
+    [[ $import_file == "$CONFIG_DIR/"* && -r $import_file ]] || { printf 'Import file must be readable inside %s\n' "$CONFIG_DIR" >&2; exit 2; }
+    imported=$(validate_config "$import_file" 2>/dev/null && jq -ce . "$import_file" || true)
+    [[ -n $imported ]] || { printf 'Imported configuration is invalid\n' >&2; exit 6; }
+    write_config "$imported"; printf 'Configuration imported\n' ;;
+  action) shift; acquire_action_lock; run_action "$@" ;;
+  *) printf 'usage: %s status [PCI] | control | diagnostics | report | export | import FILE | action ACTION VALUE [EXTRA]\n' "${0##*/}" >&2; exit 2 ;;
+esac

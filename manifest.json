@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "xyz.degendev.rog-strix-control",
+  "name": "ROG Strix Control Deck",
+  "version": "5.1.0",
+  "author": "DegenApeDev",
+  "license": "MIT",
+  "description": "ROG Strix telemetry, editable presets, adaptive game automation, diagnostics, Aura lighting and battery controls",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "ROG Strix Control Deck",
+    "description": "Controls ASUS ROG hardware with live telemetry, safe editable presets, adaptive game rules and diagnostics",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pci": "auto",
+      "intervalMs": 5000,
+      "auraPreset1": "39ff14",
+      "auraPreset2": "ff1818"
+    },
+    "schema": [
+      {"key":"pci","type":"string","label":"NVIDIA PCI address (auto or domain:bus:slot.function)"},
+      {"key":"intervalMs","type":"number","label":"Panel polling interval (ms)","min":2000,"max":60000,"step":1000},
+      {"key":"auraPreset1","type":"string","label":"Aura preset 1 RGB"},
+      {"key":"auraPreset2","type":"string","label":"Aura preset 2 RGB"}
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+name: validate
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Check shell
+        run: shellcheck rog-strix-control test.sh package.sh verify-package.sh && bash -n rog-strix-control test.sh package.sh verify-package.sh
+      - name: Verify helper contract
+        run: ./test.sh
+      - name: Build deterministic release
+        run: ./package.sh dist && sha256sum dist/rog-strix-control-*.tar.gz
