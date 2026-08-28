@@ -15,6 +15,6 @@ jobs:
       - name: Check shell
         run: shellcheck --severity=error rog-strix-control test.sh package.sh verify-package.sh && bash -n rog-strix-control test.sh package.sh verify-package.sh
       - name: Verify helper contract
-        run: bash -x ./test.sh
+        run: ./test.sh
       - name: Build deterministic release
         run: ./package.sh dist && sha256sum dist/rog-strix-control-*.tar.gz
