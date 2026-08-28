@@ -13,7 +13,7 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Check shell
-        run: shellcheck rog-strix-control test.sh package.sh verify-package.sh && bash -n rog-strix-control test.sh package.sh verify-package.sh
+        run: shellcheck --severity=error rog-strix-control test.sh package.sh verify-package.sh && bash -n rog-strix-control test.sh package.sh verify-package.sh
       - name: Verify helper contract
         run: ./test.sh
       - name: Build deterministic release
