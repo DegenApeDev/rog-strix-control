@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'printf "test failed at line %s\n" "$LINENO" >&2' ERR
 
 cd -- "$(dirname -- "$0")"
 helper=./rog-strix-control
