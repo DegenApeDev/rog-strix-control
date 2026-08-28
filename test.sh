@@ -94,8 +94,7 @@ if ROG_TEST_FAIL_ON='battery limit 80' run preset daily 2>/dev/null; then printf
 [[ $(grep -Fc 'asusctl profile set Balanced' "$capture") -ge 2 ]]
 run config-export
 [[ -s "$XDG_CONFIG_HOME/rog-strix-control/export.json" ]]
-diagnostics=$(ROG_TEST_CAPTURE="$capture" PATH="$fixture:$PATH" "$helper" diagnostics || true)
-jq -e 'has("issues") and has("healthy")' <<<"$diagnostics" >/dev/null
+ROG_TEST_CAPTURE="$capture" PATH="$fixture:$PATH" "$helper" diagnostics | jq -e 'has("issues") and has("healthy")' >/dev/null
 ROG_TEST_CAPTURE="$capture" PATH="$fixture:$PATH" "$helper" report >/dev/null
 [[ -s "$XDG_CONFIG_HOME/rog-strix-control/diagnostics.txt" ]]
 ! grep -Eq "$USER|/home/" "$XDG_CONFIG_HOME/rog-strix-control/diagnostics.txt"

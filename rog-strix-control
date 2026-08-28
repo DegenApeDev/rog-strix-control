@@ -305,7 +305,7 @@ diagnostics_json() {
   systemctl is-active --quiet asusd 2>/dev/null && asusd=active
   systemctl is-active --quiet supergfxd 2>/dev/null && supergfxd=active
   command -v nvidia-smi >/dev/null 2>&1 && nvidia=available
-  modules=$(for m in asus_nb_wmi asus_wmi nvidia; do grep -qw "^$m" /proc/modules 2>/dev/null && printf '%s ' "$m"; done | xargs)
+  modules=$(for m in asus_nb_wmi asus_wmi nvidia; do grep -qw "^$m" /proc/modules 2>/dev/null && printf '%s ' "$m"; done | xargs) || modules=''
   sensors=0
   for sensor_file in "$SYSFS_ROOT"/class/hwmon/hwmon*/temp*_input; do [[ -r $sensor_file ]] && sensors=$((sensors+1)); done
   cpu_hw=$(hwmon_dir k10temp || true)
