@@ -211,7 +211,7 @@ preset_mutation() {
 
 preset_update() {
   ensure_config
-  local name=$1 field=$2 value=$3 filter
+  local name=$1 field=$2 value=$3 filter previous
   find_preset "$name" >/dev/null || return 3
   case "$field" in
     profile) [[ $value =~ ^(Quiet|Balanced|Performance)$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.profile)=$value' ;;
@@ -221,7 +221,19 @@ preset_update() {
     auraColor) [[ $value =~ ^[0-9a-fA-F]{6}$ ]] || return 2; filter='(.presets[]|select(.name==$name)|.auraColor)=$value' ;;
     *) return 2 ;;
   esac
+  previous=$(<"$CONFIG_FILE")
   write_config "$(jq -c --arg name "$name" --arg value "$value" "$filter" "$CONFIG_FILE")"
+  # An automation preset can remain marked active for hours. Apply edits to it
+  # now instead of waiting for the next AC/battery policy transition.
+  if jq -e '.automation.enabled' "$CONFIG_FILE" >/dev/null 2>&1 \
+      && [[ -r $STATE_FILE ]] \
+      && [[ $(jq -r '.activePreset // ""' "$STATE_FILE" 2>/dev/null || true) == "$name" ]]; then
+    if ! apply_preset "$name" >/dev/null; then
+      write_config "$previous"
+      printf 'Active preset update failed; previous preset restored\n' >&2
+      return 7
+    fi
+  fi
   printf 'Preset %s updated: %s\n' "$name" "$field"
 }
 

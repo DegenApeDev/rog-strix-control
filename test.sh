@@ -75,6 +75,13 @@ run automation-set enabled true
 run automation-set quietEnabled true
 control=$(ROG_TEST_CAPTURE="$capture" PATH="$fixture:$PATH" "$helper" control)
 jq -e '.automation.enabled and .automation.quietEnabled and (.presets|any(.name=="custom" and .profile=="Performance" and .brightness=="low" and .batteryLimit==100 and .panelOd==1 and .auraColor=="aabbcc")) and (.presets|any(.name=="renamed")) and (.gameRules|any(.exe=="testgame" and .preset=="custom" and .preventSleep and .panelOverride))' <<<"$control" >/dev/null
+# Editing the preset currently held active by automation applies it immediately.
+jq -cn '{activeReason:"ac",activePreset:"custom",activeGame:"",lastSwitch:1,previousSnapshot:null,inhibitPid:0}' >"$XDG_CONFIG_HOME/rog-strix-control/runtime-state.json"
+before_count=$(grep -Fc 'asusctl battery limit 80' "$capture")
+run preset-update custom batteryLimit 80
+after_count=$(grep -Fc 'asusctl battery limit 80' "$capture")
+((after_count == before_count + 1))
+run preset-update custom batteryLimit 100
 if run automation-set thermalOff 100 2>/dev/null; then printf 'invalid thermal hysteresis accepted\n' >&2; exit 1; fi
 ln -s /usr/bin/sleep "$fixture/testgame"
 "$fixture/testgame" 30 & game_pid=$!
